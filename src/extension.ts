@@ -4,11 +4,20 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 
-// ── Status bar item (module-level so we update it from multiple places) ──────
+// ── Module-level singletons ───────────────────────────────────────────────────
 let statusBar: vscode.StatusBarItem;
+let outputChannel: vscode.OutputChannel;
+let activePanel: vscode.WebviewPanel | undefined;
+let activeProcess: cp.ChildProcess | undefined;
+
+const ANALYSIS_TIMEOUT_MS = 120_000; // 2 minutes
 
 export function activate(context: vscode.ExtensionContext) {
-  // Status bar: click to run analysis
+  // Output channel — persists across runs, visible in Output panel
+  outputChannel = vscode.window.createOutputChannel("racevis");
+  context.subscriptions.push(outputChannel);
+
+  // Status bar
   statusBar = vscode.window.createStatusBarItem(
     vscode.StatusBarAlignment.Left,
     100
@@ -19,14 +28,23 @@ export function activate(context: vscode.ExtensionContext) {
   statusBar.show();
   context.subscriptions.push(statusBar);
 
-  // Register the main command
-  const cmd = vscode.commands.registerCommand("racevis.analyze", async () => {
-    await runAnalysis(context);
-  });
-  context.subscriptions.push(cmd);
+  // Commands
+  context.subscriptions.push(
+    vscode.commands.registerCommand("racevis.analyze", async () => {
+      await runAnalysis(context);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("racevis.showOutput", () => {
+      outputChannel.show();
+    })
+  );
 }
 
-export function deactivate() {}
+export function deactivate() {
+  activeProcess?.kill();
+}
 
 // ── Core analysis flow ────────────────────────────────────────────────────────
 
@@ -41,7 +59,11 @@ async function runAnalysis(context: vscode.ExtensionContext) {
   }
 
   // 2. Check for Go files
-  const goFiles = await vscode.workspace.findFiles("**/*.go", "**/vendor/**", 1);
+  const goFiles = await vscode.workspace.findFiles(
+    "**/*.go",
+    "**/vendor/**",
+    1
+  );
   if (goFiles.length === 0) {
     vscode.window.showErrorMessage(
       "racevis: No Go files found in this workspace."
@@ -58,29 +80,64 @@ async function runAnalysis(context: vscode.ExtensionContext) {
       ? workspaceFolder
       : path.resolve(workspaceFolder, targetSetting);
 
-  // 4. Check binary exists
+  // 4. Resolve binary
   const resolvedBinary = resolveBinary(binaryPath);
   if (!resolvedBinary) {
     vscode.window.showErrorMessage(
       `racevis: binary not found at '${binaryPath}'. ` +
-        `Install with: go install github.com/bramakrishna16/racevis@latest`
-    );
+        `Install with: go install github.com/bramakrishna16/racevis@latest`,
+      "Show Output"
+    ).then((choice) => {
+      if (choice === "Show Output") { outputChannel.show(); }
+    });
     return;
   }
 
-  // 5. Run with progress notification
-  statusBar.text = "⚡ racevis $(sync~spin)";
+  // 5. Kill any in-flight analysis
+  if (activeProcess) {
+    activeProcess.kill();
+    activeProcess = undefined;
+    outputChannel.appendLine("[racevis] previous analysis cancelled");
+  }
 
+  // 6. Use workspace-scoped temp file to avoid collisions
+  const safeFolder = workspaceFolder.replace(/[^a-zA-Z0-9]/g, "_");
+  const jsonOut = path.join(os.tmpdir(), `racevis-${safeFolder}.json`);
+
+  outputChannel.clear();
+  outputChannel.appendLine(`[racevis] analyzing: ${target}`);
+  outputChannel.appendLine(`[racevis] binary: ${resolvedBinary}`);
+
+  setStatusRunning();
+
+  // 7. Cancellable progress
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
       title: "racevis",
-      cancellable: false,
+      cancellable: true,
     },
-    async (progress) => {
+    async (progress, token) => {
       progress.report({ message: "Running race detector..." });
 
-      const jsonOut = path.join(os.tmpdir(), "racevis-out.json");
+      token.onCancellationRequested(() => {
+        outputChannel.appendLine("[racevis] cancelled by user");
+        activeProcess?.kill();
+        activeProcess = undefined;
+        setStatusIdle();
+      });
+
+      let timedOut = false;
+      const timeoutHandle = setTimeout(() => {
+        timedOut = true;
+        activeProcess?.kill();
+        activeProcess = undefined;
+        setStatusIdle();
+        vscode.window.showErrorMessage(
+          `racevis: analysis timed out after ${ANALYSIS_TIMEOUT_MS / 1000}s. ` +
+            `Try -run to target a specific test.`
+        );
+      }, ANALYSIS_TIMEOUT_MS);
 
       try {
         await execBinary(resolvedBinary, [
@@ -89,100 +146,140 @@ async function runAnalysis(context: vscode.ExtensionContext) {
           "-target", target,
         ]);
       } catch (err: any) {
-        // racevis exits non-zero when races are found — that's not a failure.
-        // Only bail if the JSON wasn't written at all.
+        clearTimeout(timeoutHandle);
+        if (timedOut || token.isCancellationRequested) { return; }
+        // Non-zero exit is normal when races are found — only bail if no JSON
         if (!fs.existsSync(jsonOut)) {
-          statusBar.text = "⚡ racevis";
-          vscode.window.showErrorMessage(`racevis failed: ${err.message}`);
+          setStatusIdle();
+          outputChannel.appendLine(`[racevis] error: ${err.message}`);
+          vscode.window.showErrorMessage(
+            `racevis failed. Check Output panel for details.`,
+            "Show Output"
+          ).then((c) => { if (c === "Show Output") { outputChannel.show(); } });
           return;
         }
       }
 
+      clearTimeout(timeoutHandle);
+      if (timedOut || token.isCancellationRequested) { return; }
+
       progress.report({ message: "Rendering timeline..." });
 
-      // 6. Read JSON
+      // 8. Read JSON
       let timelineJson: string;
       try {
         timelineJson = fs.readFileSync(jsonOut, "utf8");
       } catch (err: any) {
-        statusBar.text = "⚡ racevis";
+        setStatusIdle();
+        outputChannel.appendLine(`[racevis] could not read JSON: ${err.message}`);
         vscode.window.showErrorMessage(
-          `racevis: could not read output JSON: ${err.message}`
-        );
+          "racevis: could not read output. Check Output panel.",
+          "Show Output"
+        ).then((c) => { if (c === "Show Output") { outputChannel.show(); } });
         return;
       }
 
-      // 7. Parse to get race count for status bar
+      // 9. Parse race count — correct field is raceEvents
       let raceCount = 0;
       try {
         const timeline = JSON.parse(timelineJson);
-        raceCount = timeline?.races?.length ?? 0;
+        raceCount = timeline?.raceEvents?.length ?? 0;
+        outputChannel.appendLine(
+          `[racevis] found ${raceCount} race event(s), ` +
+            `${timeline?.lanes?.length ?? 0} goroutine lane(s)`
+        );
       } catch {
-        // non-fatal — we still show the webview
+        outputChannel.appendLine("[racevis] warning: could not parse timeline JSON");
       }
 
-      // 8. Load embedded ui/index.html from the racevis binary's report output
-      //    We ship ui/index.html inside the extension under media/index.html
+      // 10. Load media/index.html
       const htmlPath = path.join(context.extensionPath, "media", "index.html");
       if (!fs.existsSync(htmlPath)) {
-        statusBar.text = "⚡ racevis";
+        setStatusIdle();
         vscode.window.showErrorMessage(
-          "racevis: media/index.html not found in extension. " +
-            "Run 'scripts/copy-ui.sh' to copy it from the racevis repo."
+          "racevis: media/index.html missing from extension bundle."
         );
         return;
       }
       let html = fs.readFileSync(htmlPath, "utf8");
 
-      // 9. Inject timeline JSON — mirrors exportHTMLReport in racevis/main.go
+      // 11. Inject timeline JSON — mirrors exportHTMLReport in racevis/main.go
       const inlineScript = `<script>\nwindow.__RACEVIS_INLINE_DATA__ = ${timelineJson};\n</script>\n`;
       html = html.replace("<script>", inlineScript + "<script>");
 
-      // 10. Open webview
-      const panel = vscode.window.createWebviewPanel(
-        "racevis",
-        `racevis — ${path.basename(target)}`,
-        vscode.ViewColumn.Two,
-        {
-          enableScripts: true,
-          retainContextWhenHidden: true,
-          localResourceRoots: [], // all resources are inline
-        }
-      );
-      panel.webview.html = html;
-
-      // 11. Update status bar
-      if (raceCount === 0) {
-        statusBar.text = "⚡ racevis ✓ no races";
-        statusBar.backgroundColor = undefined;
+      // 12. Reuse existing panel or create new one
+      if (activePanel) {
+        activePanel.reveal(vscode.ViewColumn.Two, true);
+        activePanel.webview.html = html;
+        activePanel.title = `racevis — ${path.basename(target)}`;
       } else {
-        statusBar.text = `⚡ racevis 🔴 ${raceCount} race${raceCount === 1 ? "" : "s"}`;
-        statusBar.backgroundColor = new vscode.ThemeColor(
-          "statusBarItem.errorBackground"
+        activePanel = vscode.window.createWebviewPanel(
+          "racevis",
+          `racevis — ${path.basename(target)}`,
+          { viewColumn: vscode.ViewColumn.Two, preserveFocus: true },
+          {
+            enableScripts: true,
+            retainContextWhenHidden: true,
+            localResourceRoots: [],
+          }
         );
+        activePanel.onDidDispose(() => {
+          activePanel = undefined;
+        });
+        activePanel.webview.html = html;
       }
+
+      // 13. Update status bar
+      setStatusResult(raceCount);
     }
   );
 }
 
+// ── Status bar helpers ────────────────────────────────────────────────────────
+
+function setStatusRunning() {
+  statusBar.text = "⚡ racevis $(sync~spin)";
+  statusBar.backgroundColor = undefined;
+  statusBar.tooltip = "Race detector running...";
+}
+
+function setStatusIdle() {
+  statusBar.text = "⚡ racevis";
+  statusBar.backgroundColor = undefined;
+  statusBar.tooltip = "Click to run race detector on current package";
+}
+
+function setStatusResult(raceCount: number) {
+  if (raceCount === 0) {
+    statusBar.text = "⚡ racevis ✓ no races";
+    statusBar.backgroundColor = undefined;
+    statusBar.tooltip = "No races found. Click to re-run.";
+  } else {
+    statusBar.text = `⚡ racevis 🔴 ${raceCount} race${raceCount === 1 ? "" : "s"}`;
+    statusBar.backgroundColor = new vscode.ThemeColor(
+      "statusBarItem.errorBackground"
+    );
+    statusBar.tooltip = `${raceCount} data race(s) found. Click to re-run.`;
+  }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/**
- * Resolve the racevis binary path. Accepts absolute paths or PATH lookups.
- * Returns null if not found.
- */
 function resolveBinary(binaryPath: string): string | null {
   if (path.isAbsolute(binaryPath)) {
     return fs.existsSync(binaryPath) ? binaryPath : null;
   }
-  // VS Code Node does not inherit shell PATH on macOS.
-  // Augment with common Go binary locations.
+  // VS Code's Node process doesn't inherit shell PATH on macOS.
+  // Prepend common Go binary locations.
   const extraDirs = [
     path.join(os.homedir(), "go", "bin"),
     "/usr/local/go/bin",
     "/opt/homebrew/bin",
   ];
-  const pathDirs = [...extraDirs, ...(process.env.PATH || "").split(path.delimiter)];
+  const pathDirs = [
+    ...extraDirs,
+    ...(process.env.PATH || "").split(path.delimiter),
+  ];
   for (const dir of pathDirs) {
     const candidate = path.join(dir, binaryPath);
     if (fs.existsSync(candidate)) {
@@ -192,18 +289,28 @@ function resolveBinary(binaryPath: string): string | null {
   return null;
 }
 
-/**
- * Run the racevis binary and return stdout+stderr.
- * Resolves when the process exits (any exit code).
- * Rejects only on spawn failure (binary not found / permission denied).
- */
 function execBinary(binary: string, args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
     let output = "";
     const proc = cp.spawn(binary, args, { env: process.env });
-    proc.stdout.on("data", (d) => (output += d.toString()));
-    proc.stderr.on("data", (d) => (output += d.toString()));
-    proc.on("error", reject);
-    proc.on("close", () => resolve(output));
+    activeProcess = proc;
+    proc.stdout.on("data", (d: Buffer) => {
+      const s = d.toString();
+      output += s;
+      outputChannel.append(s);
+    });
+    proc.stderr.on("data", (d: Buffer) => {
+      const s = d.toString();
+      output += s;
+      outputChannel.append(s);
+    });
+    proc.on("error", (err) => {
+      activeProcess = undefined;
+      reject(err);
+    });
+    proc.on("close", () => {
+      activeProcess = undefined;
+      resolve(output);
+    });
   });
 }

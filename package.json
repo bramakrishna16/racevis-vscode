@@ -2,8 +2,13 @@
   "name": "racevis",
   "displayName": "racevis",
   "description": "Go race condition visualizer",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "publisher": "bullish-labs",
+  "icon": "icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bramakrishna16/racevis-vscode"
+  },
   "engines": {
     "vscode": "^1.120.0"
   },
@@ -11,6 +16,10 @@
     "Debuggers",
     "Testing"
   ],
+  "galleryBanner": {
+    "color": "#111111",
+    "theme": "dark"
+  },
   "activationEvents": [],
   "main": "./dist/extension.js",
   "contributes": {
@@ -18,6 +27,10 @@
       {
         "command": "racevis.analyze",
         "title": "racevis: Analyze current package"
+      },
+      {
+        "command": "racevis.showOutput",
+        "title": "racevis: Show output log"
       }
     ],
     "configuration": {
@@ -59,14 +72,5 @@
     "webpack-cli": "^6.0.1",
     "@vscode/test-cli": "^0.0.12",
     "@vscode/test-electron": "^2.5.2"
-  },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/bramakrishna16/racevis-vscode"
-  },
-  "icon": "icon.png",
-  "galleryBanner": {
-    "color": "#111111",
-    "theme": "dark"
   }
 }
