@@ -2,7 +2,7 @@
   "name": "racevis",
   "displayName": "racevis",
   "description": "Go race condition visualizer",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "publisher": "bullish-labs",
   "icon": "icon.png",
   "repository": {
@@ -43,8 +43,8 @@
         },
         "racevis.target": {
           "type": "string",
-          "default": ".",
-          "description": "Go package to analyze. Defaults to workspace root ('.')."
+          "default": "auto",
+          "description": "Go package to analyze. Use 'auto' to infer a package with _test.go files from the active Go file, or pick from discovered test packages."
         }
       }
     }

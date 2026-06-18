@@ -25,11 +25,16 @@ Click any collision zone and see the exact lines from both goroutines, highlight
 ## Usage
 
 1. Open any Go project in VS Code
-2. `Cmd+Shift+P` → `racevis: Analyze current package`
-3. The ECG timeline opens in the right panel
-4. Click any red collision diamond to inspect the race
+2. Open a `.go` file in the package you want to inspect
+3. `Cmd+Shift+P` → `racevis: Analyze current package`
+4. The ECG timeline opens in the right panel
+5. Click any red collision diamond to inspect the race
 
 The status bar shows `⚡ racevis` at all times — click it to re-run.
+
+If the active package has no `_test.go` files, racevis discovers packages with tests using `go list ./...` and asks you to pick one.
+
+The test list shows visualized tests only. A test appears when a race event stack involved that `TestXxx`, or when the runtime trace has a goroutine creation stack containing that `TestXxx`. Plain synchronous tests with no race evidence are intentionally omitted.
 
 ---
 
@@ -54,7 +59,7 @@ which racevis
 | Setting | Default | Description |
 |---|---|---|
 | `racevis.binaryPath` | `racevis` | Full path to the racevis binary. Set this if racevis is not on PATH. |
-| `racevis.target` | `.` | Go package to analyze. Use `./mypackage` to target a subdirectory. |
+| `racevis.target` | `auto` | Infer a package with `_test.go` files from the active Go file. Set `internal/broker` or another package path to override. |
 
 ---
 
@@ -66,6 +71,8 @@ racevis runs a two-pass pipeline:
 2. **Pass 2** — `go test -trace` captures the scheduler trace (when each goroutine ran, waited, and blocked)
 3. **Correlate** — joins both on goroutine ID to produce a Timeline
 4. **Render** — the ECG timeline is injected into a self-contained webview — no server, no port, fully offline
+
+Green lanes mean trace-visible goroutines ran without race detector findings. Red diamonds mean the race detector observed a real contested memory access.
 
 ---
 

@@ -74,11 +74,10 @@ async function runAnalysis(context: vscode.ExtensionContext) {
   // 3. Read settings
   const config = vscode.workspace.getConfiguration("racevis");
   const binaryPath = config.get<string>("binaryPath") || "racevis";
-  const targetSetting = config.get<string>("target") || ".";
-  const target =
-    targetSetting === "."
-      ? workspaceFolder
-      : path.resolve(workspaceFolder, targetSetting);
+  const target = await resolveTarget(workspaceFolder, config);
+  if (!target) {
+    return;
+  }
 
   // 4. Resolve binary
   const resolvedBinary = resolveBinary(binaryPath);
@@ -287,6 +286,107 @@ function resolveBinary(binaryPath: string): string | null {
     }
   }
   return null;
+}
+
+async function resolveTarget(
+  workspaceFolder: string,
+  config: vscode.WorkspaceConfiguration
+): Promise<string | undefined> {
+  const targetSetting = config.get<string>("target") || "auto";
+
+  if (targetSetting !== "." && targetSetting !== "auto") {
+    const configuredTarget = path.isAbsolute(targetSetting)
+      ? targetSetting
+      : path.resolve(workspaceFolder, targetSetting);
+
+    if (isGoPackageDir(configuredTarget)) {
+      return configuredTarget;
+    }
+
+    vscode.window.showErrorMessage(
+      `racevis: configured target is not a Go package: ${configuredTarget}`
+    );
+    return undefined;
+  }
+
+  const activeFile = vscode.window.activeTextEditor?.document.uri.fsPath;
+  if (activeFile?.endsWith(".go")) {
+    const activePackage = path.dirname(activeFile);
+    if (isGoPackageDir(activePackage) && hasGoTestFiles(activePackage)) {
+      return activePackage;
+    }
+  }
+
+  if (isGoPackageDir(workspaceFolder) && hasGoTestFiles(workspaceFolder)) {
+    return workspaceFolder;
+  }
+
+  return pickPackage(workspaceFolder);
+}
+
+function isGoPackageDir(dir: string): boolean {
+  try {
+    return fs
+      .readdirSync(dir, { withFileTypes: true })
+      .some((entry) => entry.isFile() && entry.name.endsWith(".go"));
+  } catch {
+    return false;
+  }
+}
+
+function hasGoTestFiles(dir: string): boolean {
+  try {
+    return fs
+      .readdirSync(dir, { withFileTypes: true })
+      .some((entry) => entry.isFile() && entry.name.endsWith("_test.go"));
+  } catch {
+    return false;
+  }
+}
+
+async function pickPackage(workspaceFolder: string): Promise<string | undefined> {
+  let packageDirs: string[];
+  try {
+    const output = cp
+      .execFileSync("go", ["list", "-f", "{{.Dir}}", "./..."], {
+        cwd: workspaceFolder,
+        encoding: "utf8",
+        env: process.env,
+      })
+      .trim();
+    packageDirs = output ? output.split("\n") : [];
+  } catch (err: any) {
+    outputChannel.appendLine(`[racevis] go list failed: ${err.message}`);
+    vscode.window.showErrorMessage(
+      "racevis: could not discover Go packages. Open a Go file or set racevis.target."
+    );
+    return undefined;
+  }
+
+  packageDirs = packageDirs.filter(hasGoTestFiles);
+
+  if (packageDirs.length === 0) {
+    vscode.window.showErrorMessage(
+      "racevis: no Go packages with tests found. Open a package with _test.go files or set racevis.target."
+    );
+    return undefined;
+  }
+
+  if (packageDirs.length === 1) {
+    return packageDirs[0];
+  }
+
+  const items = packageDirs.map((dir) => ({
+    label: path.relative(workspaceFolder, dir) || ".",
+    description: dir,
+    dir,
+  }));
+
+  const selected = await vscode.window.showQuickPick(items, {
+    placeHolder: "Select Go package with tests to analyze with racevis",
+  });
+
+  return selected?.dir;
 }
 
 function execBinary(binary: string, args: string[]): Promise<string> {
